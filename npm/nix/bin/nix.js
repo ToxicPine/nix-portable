@@ -6,6 +6,8 @@ const path = require("node:path");
 const packages = {
   "linux:x64": "@cardelli/nix-linux-x64",
   "linux:arm64": "@cardelli/nix-linux-arm64",
+  "darwin:x64": "@cardelli/nix-darwin-x64",
+  "darwin:arm64": "@cardelli/nix-darwin-arm64",
 };
 
 const key = `${process.platform}:${process.arch}`;
@@ -13,7 +15,7 @@ const platformPackage = packages[key];
 
 if (!platformPackage) {
   console.error(
-    "nix-portable supports Linux x64 and arm64 only. On macOS use the native Nix installer; on Windows use WSL."
+    "@cardelli/nix supports linux x64/arm64 and darwin x64/arm64. On Windows use WSL."
   );
   process.exit(1);
 }
@@ -23,7 +25,7 @@ try {
   portable = require.resolve(`${platformPackage}/bin/nix-portable`);
 } catch (error) {
   console.error(`The optional package ${platformPackage} was not installed.`);
-  console.error("Reinstall @cardelli/nix on a supported Linux platform.");
+  console.error(`Reinstall @cardelli/nix on ${process.platform} ${process.arch}.`);
   process.exit(1);
 }
 

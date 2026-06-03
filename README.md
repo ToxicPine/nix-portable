@@ -11,7 +11,8 @@ runtime:
 2. Bubblewrap
 3. PRoot
 
-Linux `x86_64` and `aarch64` are supported.
+Linux `x86_64` and `aarch64` are supported by the self-contained portable
+binary.
 
 ## npm
 
@@ -36,9 +37,17 @@ The npm distribution follows the native-binary package pattern:
 - `@cardelli/nix` is the small JavaScript launcher.
 - `@cardelli/nix-linux-x64` contains the Linux x64 `nix-portable` binary.
 - `@cardelli/nix-linux-arm64` contains the Linux arm64 `nix-portable` binary.
+- `@cardelli/nix-darwin-x64` contains a macOS x64 native Nix shim.
+- `@cardelli/nix-darwin-arm64` contains a macOS arm64 native Nix shim.
+
+The Darwin packages are intentionally not self-contained nix-portable payloads:
+this repository's portable runtime depends on Linux sandbox/runtime tools. On
+macOS the package is a testable wrapper around the native Nix installation
+already available in `PATH`, so install Nix from the native installer before
+using `@cardelli/nix` there.
 
 Unsupported platforms fail with a direct message. Windows users should run it
-inside WSL; macOS users should use the native Nix installer.
+inside WSL.
 
 ## Direct Binary
 
@@ -78,7 +87,22 @@ order:
 
 1. `result/packages/nix-linux-x64`
 2. `result/packages/nix-linux-arm64`
-3. `result/packages/nix`
+3. `result/packages/nix-darwin-x64`
+4. `result/packages/nix-darwin-arm64`
+5. `result/packages/nix`
+
+To smoke-test the macOS shim from a generated `result` tree copied to a Mac
+with native Nix already loaded in `PATH`:
+
+```sh
+cd result
+arch=$(node -p 'process.arch')
+tmp=$(mktemp -d)
+npm pack --pack-destination "$tmp" packages/nix "packages/nix-darwin-$arch"
+cd "$tmp"
+npm install "./cardelli-nix-2.20.6-portable.0.tgz" "./cardelli-nix-darwin-$arch-2.20.6-portable.0.tgz"
+npx nix --version
+```
 
 ## Runtime Environment
 
