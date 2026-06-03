@@ -16,6 +16,10 @@
   perl ? pkgs.perl,
   pkgs ? import <nixpkgs> {},
   zstd ? pkgs.pkgsStatic.zstd,
+  zstdBuild ? buildPackages.zstd,
+  zipBuild ? buildPackages.zip,
+  unzipBuild ? buildPackages.unzip,
+  unixtoolsBuild ? buildPackages.unixtools,
   nixStatic,
   bundledPackage ? null,
   ...
@@ -46,7 +50,7 @@ let
     in
       stdenv.mkDerivation {
         name = "nix-portable-store-tarball";
-        nativeBuildInputs = [ perl zstd ];
+        nativeBuildInputs = [ perl zstdBuild ];
         exportReferencesGraph = map (x: [ ("closure-" + baseNameOf x) x ]) targets;
         buildCommand = ''
           storePaths=$(cat ${closureInfo}/store-paths)
@@ -71,7 +75,7 @@ let
       '';
 
   caBundleZstd = pkgs.runCommand "cacerts" {} ''
-    ${zstd}/bin/zstd -19 < ${cacert}/etc/ssl/certs/ca-bundle.crt > "$out"
+    ${zstdBuild}/bin/zstd -19 < ${cacert}/etc/ssl/certs/ca-bundle.crt > "$out"
   '';
 
   packedBwrap = packStaticBin "${inp.bwrap}/bin/bwrap";
@@ -122,7 +126,7 @@ let
     '';
   };
 
-  nixPortable = pkgs.runCommand pname { nativeBuildInputs = [ unixtools.xxd unzip ]; } ''
+  nixPortable = pkgs.runCommand pname { nativeBuildInputs = [ unixtoolsBuild.xxd unzipBuild ]; } ''
     mkdir -p "$out/bin"
     cp ${runtimeScript} "$out/bin/nix-portable.zip"
     chmod +w "$out/bin/nix-portable.zip"
@@ -141,7 +145,7 @@ let
 
     unzip -vl "$out/bin/nix-portable.zip"
 
-    zip="${zip}/bin/zip -0"
+    zip="${zipBuild}/bin/zip -0"
     $zip "$out/bin/nix-portable.zip" ${packedBwrap}/bin/bwrap
     $zip "$out/bin/nix-portable.zip" ${packedNixStatic}/bin/nix
     $zip "$out/bin/nix-portable.zip" ${packedProot}/bin/proot
@@ -154,7 +158,7 @@ let
     fp=$(sha256sum "$out/bin/nix-portable.zip" | cut -d " " -f 1)
     sed -i "s/_FINGERPRINT_PLACEHOLDER_/$fp/g" "$out/bin/nix-portable.zip"
 
-    ${zip}/bin/zip -F "$out/bin/nix-portable.zip" --out "$out/bin/nix-portable-fixed.zip"
+    ${zipBuild}/bin/zip -F "$out/bin/nix-portable.zip" --out "$out/bin/nix-portable-fixed.zip"
 
     rm "$out/bin/nix-portable.zip"
     executable='${bundledExe}'

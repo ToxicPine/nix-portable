@@ -36,6 +36,11 @@
           # the static proot built with nix somehow didn't work on other systems,
           # therefore using the proot static build from proot gitlab
           proot = import ./proot/alpine.nix { inherit pkgs; };
+          bwrap = pkgs.pkgsStatic.bubblewrap.override {
+            libcap = pkgs.pkgsStatic.libcap.override {
+              withGo = false;
+            };
+          };
         in
           # crashes if nixpkgs updated: error: executing 'git': No such file or directory
           pkgs.callPackage ./default.nix {
@@ -51,7 +56,7 @@
             nixStatic = inp.nix.packages.${pkgs.stdenv.buildPlatform.system}.nix-static;
 
             busybox = pkgs.pkgsStatic.busybox;
-            bwrap = pkgs.pkgsStatic.bubblewrap;
+            inherit bwrap;
             gnutar = pkgs.pkgsStatic.gnutar;
             perl = pkgs.pkgsBuildBuild.perl;
             xz = pkgs.pkgsStatic.xz;
