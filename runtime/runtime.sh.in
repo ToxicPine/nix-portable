@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+
+set -eo pipefail
+
+start=$(date +%s%N)
+
+case "${NP_DEBUG:-}" in
+  '' | *[!0-9]*) NP_DEBUG_LEVEL=0 ;;
+  *) NP_DEBUG_LEVEL=${NP_DEBUG} ;;
+esac
+
+if ((NP_DEBUG_LEVEL >= 1)); then
+  trap 'declare -p > "${TMPDIR:-/tmp}/np_env"' EXIT
+  exec 3>&2
+else
+  exec 3>/dev/null
+fi
+
+debug() {
+  if ((NP_DEBUG_LEVEL >= 1)); then
+    printf '%s\n' "$*" >&3 || true
+  fi
+}
+
+if [[ -n "${TERMUX_VERSION:-}" ]]; then
+  unset LD_PRELOAD
+  NP_RUNTIME=${NP_RUNTIME:-proot}
+  export PROOT_TMP_DIR="${TMPDIR:-/tmp}/proot"
+  mkdir -p "${PROOT_TMP_DIR}"
+else
+  export PROOT_NO_SECCOMP=${PROOT_NO_SECCOMP:-1}
+fi
+
+if ((NP_DEBUG_LEVEL >= 2)); then
+  set -x
+fi
+
+self=$(realpath "${BASH_SOURCE[0]}")
+fingerprint="_FINGERPRINT_PLACEHOLDER_"
+
+NP_LOCATION=${NP_LOCATION:-${HOME}}
+NP_LOCATION=$(readlink -f "${NP_LOCATION}")
+dir="${NP_LOCATION}/.nix-portable"
+store="${dir}/nix/store"
+
+mkdir -p "${dir}/bin" "${dir}/nix/var/nix" "${dir}/nix/store"
+rm -rf "${dir}/tmpbin"
+mkdir -p "${dir}/tmpbin"
+
+cat > "${dir}/mini-drv.nix" <<'NIX'
+builtins.derivation {name="foo"; builder="/bin/sh"; args = ["-c" "echo hello > $out"]; system=builtins.currentSystem;}
+NIX
+
+installed_fingerprint=
+if [[ -e "${dir}/conf/fingerprint" ]]; then
+  installed_fingerprint=$(cat "${dir}/conf/fingerprint")
+fi
+
+if [[ "${installed_fingerprint}" = "${fingerprint}" ]]; then
+  new_np_version=false
+else
+  new_np_version=true
+fi
+
+export NIX_CONF_DIR="${dir}/conf"
+NP_CONF_SANDBOX=${NP_CONF_SANDBOX:-false}
+NP_CONF_STORE=${NP_CONF_STORE:-auto}
+
+recreate_nix_conf() {
+  mkdir -p "${NIX_CONF_DIR}"
+  {
+    printf 'build-users-group = \n'
+    printf 'experimental-features = nix-command flakes\n'
+    printf 'ignored-acls = security.selinux system.nfs4_acl\n'
+    printf 'sandbox-paths = /bin/sh=%s/busybox/bin/busybox\n' "${dir}"
+    printf 'sandbox = %s\n' "${NP_CONF_SANDBOX}"
+    printf 'store = %s\n' "${NP_CONF_STORE}"
+  } > "${NIX_CONF_DIR}/nix.conf"
+}
+
+install_zip_bin() {
+  local archive_path=$1
+  local bin_name=$2
+
+  unzip -qqoj "${self}" "${archive_path}" -d "${dir}/bin"
+  chmod ugo+wx "${dir}/bin/${bin_name}"
+}
+
+PATH_OLD=${PATH}
+
+if [[ "${new_np_version}" = false ]]; then
+  debug "binaries already installed"
+  export PATH="${TERMUX_VERSION:+${PATH}:}${dir}/busybox/bin"
+else
+  debug "installing files"
+
+  mkdir -p "${dir}/emptyroot" "${dir}/busybox/bin"
+  (base64 -d > "${dir}/busybox/bin/busybox" && chmod +x "${dir}/busybox/bin/busybox") <<'NIX_PORTABLE_BUSYBOX'
+@busyboxBase64@
+NIX_PORTABLE_BUSYBOX
+
+  busy_bins=( @busyboxBins@ )
+  for bin_name in "${busy_bins[@]}"; do
+    [[ -e "${dir}/busybox/bin/${bin_name}" ]] || ln -s busybox "${dir}/busybox/bin/${bin_name}"
+  done
+
+  export PATH="${TERMUX_VERSION:+${PATH}:}${dir}/busybox/bin"
+
+  install_zip_bin "@zstdZipPath@" zstd
+  install_zip_bin "@prootZipPath@" proot
+  install_zip_bin "@bwrapZipPath@" bwrap
+  install_zip_bin "@nixStaticZipPath@" nix
+
+  unzip -poj "${self}" "@caBundleZipPath@" | "${dir}/bin/zstd" -d > "${dir}/ca-bundle.crt"
+
+  recreate_nix_conf
+fi
+
+debug "figuring out ssl certs"
+if [[ -z "${SSL_CERT_FILE:-}" ]]; then
+  debug "SSL_CERT_FILE not defined. trying to find certs automatically"
+  if [[ -e /etc/ssl/certs/ca-bundle.crt ]]; then
+    SSL_CERT_FILE=$(realpath /etc/ssl/certs/ca-bundle.crt)
+    export SSL_CERT_FILE
+    debug "found /etc/ssl/certs/ca-bundle.crt with real path ${SSL_CERT_FILE}"
+  elif [[ -e /etc/ssl/certs/ca-certificates.crt ]]; then
+    SSL_CERT_FILE=$(realpath /etc/ssl/certs/ca-certificates.crt)
+    export SSL_CERT_FILE
+    debug "found /etc/ssl/certs/ca-certificates.crt with real path ${SSL_CERT_FILE}"
+  elif [[ ! -e /etc/ssl/certs ]]; then
+    debug "/etc/ssl/certs does not exist. Will use certs from nixpkgs."
+    export SSL_CERT_FILE="${dir}/ca-bundle.crt"
+  else
+    debug "certs seem to reside in /etc/ssl/certs. No need to set up anything"
+  fi
+fi
+
+if [[ -n "${SSL_CERT_FILE:-}" ]]; then
+  ssl_bind=( "$(realpath "${SSL_CERT_FILE}")" "${dir}/ca-bundle.crt" )
+  export SSL_CERT_FILE="${dir}/ca-bundle.crt"
+else
+  ssl_bind=( /etc/ssl /etc/ssl )
+fi
+
+if [[ -n "${NP_GIT:-}" ]]; then
+  do_install_git=false
+  ln -s "${NP_GIT}" "${dir}/tmpbin/git"
+else
+  do_install_git=true
+fi
+
+store_path_of_file() {
+  local file=$1
+  local _ first second third rest
+
+  file=$(realpath "${file}")
+  IFS=/ read -r _ first second third rest <<< "${file}"
+  printf '/%s/%s/%s\n' "${first}" "${second}" "${third}"
+}
+
+bind_pairs=()
+
+append_bind() {
+  bind_pairs+=( "$1" "$2" )
+}
+
+append_resolved_bind() {
+  local path=$1
+  local target_mode=$2
+  local real_path store_path
+
+  [[ -e "${path}" ]] || return 0
+  real_path=$(realpath "${path}")
+  [[ -e "${real_path}" ]] || return 0
+
+  if [[ ${real_path} == /nix/store/* ]]; then
+    store_path=$(store_path_of_file "${real_path}")
+    append_bind "${store_path}" "${store_path}"
+  elif [[ "${target_mode}" = original ]]; then
+    append_bind "${real_path}" "${path}"
+  else
+    append_bind "${real_path}" "${real_path}"
+  fi
+}
+
+collect_binds() {
+  local path top_paths real_home
+  local default_paths=(
+    /etc/host.conf
+    /etc/hosts
+    /etc/hosts.equiv
+    /etc/mtab
+    /etc/netgroup
+    /etc/networks
+    /etc/passwd
+    /etc/group
+    /etc/nsswitch.conf
+    /etc/resolv.conf
+    /etc/localtime
+    "${HOME}"
+  )
+
+  if ! top_paths=$(find / -mindepth 1 -maxdepth 1 -not -name nix -not -name dev 2>&3); then
+    debug "Error: unable to list top level directories. Falling back to default binds."
+    top_paths="/etc /proc"
+  fi
+
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
+    append_resolved_bind "${path}" original
+  done <<< "${top_paths}"
+
+  for path in "${default_paths[@]}"; do
+    append_resolved_bind "${path}" real
+  done
+
+  if [[ -n "${HOME:-}" ]] && real_home=$(realpath "${HOME}/../usr/etc/resolv.conf" 2>/dev/null); then
+    :
+  else
+    real_home=
+  fi
+
+  bin_sh=$(realpath /bin/sh)
+  if [[ -s /bin/sh && ${bin_sh} == /nix/store/* ]]; then
+    append_bind "${dir}/busybox/bin" /bin
+  fi
+
+  append_bind "${dir}/busybox/bin/busybox" /bin/sh
+
+  if [[ -n "${TERMUX_VERSION:-}" ]]; then
+    append_bind /system/lib64/libc.so /system/lib64/libc.so
+    append_bind /system/lib64/ld-android.so /system/lib64/ld-android.so
+    append_bind /system/lib64/libdl.so /system/lib64/libdl.so
+    append_bind /system/bin /system/bin
+    append_bind /system/lib64 /system/lib64
+    append_bind /apex/com.android.runtime/bin /apex/com.android.runtime/bin
+    append_bind /linkerconfig/ld.config.txt /linkerconfig/ld.config.txt
+    append_bind "${dir}/ca-bundle.crt" /etc/ssl/certs/ca-certificates.crt
+    [[ -n "${real_home}" ]] && append_bind "${real_home}" /etc/resolv.conf
+  fi
+}
+
+make_bind_args() {
+  local arg=$1
+  local sep=$2
+  local i from to
+
+  bind_args=()
+  for ((i = 0; i < ${#bind_pairs[@]}; i += 2)); do
+    from=${bind_pairs[i]}
+    to=${bind_pairs[i + 1]}
+    if [[ "${sep}" = separate ]]; then
+      bind_args+=( "${arg}" "${from}" "${to}" )
+    else
+      bind_args+=( "${arg}" "${from}${sep}${to}" )
+    fi
+  done
+}
+
+split_args() {
+  local -n _out=$1
+  local words=${2:-}
+
+  _out=()
+  if [[ -n "${words}" ]]; then
+    # Preserve the historical behavior: these override variables are split as
+    # plain shell words and are not a quoting language.
+    read -r -a _out <<< "${words}"
+  fi
+}
+
+debug "figuring out which runtime to use"
+if [[ -z "${NP_BWRAP:-}" ]]; then
+  NP_BWRAP=$(PATH="${PATH_OLD}:${PATH}" command -v bwrap 2>/dev/null || true)
+fi
+[[ -n "${NP_BWRAP:-}" ]] || NP_BWRAP="${dir}/bin/bwrap"
+debug "bwrap executable: ${NP_BWRAP}"
+
+NP_NIX=${NP_NIX:-${dir}/bin/nix}
+debug "nix executable: ${NP_NIX}"
+
+if [[ -z "${NP_PROOT:-}" ]]; then
+  NP_PROOT=$(PATH="${PATH_OLD}:${PATH}" command -v proot 2>/dev/null || true)
+fi
+[[ -n "${NP_PROOT:-}" ]] || NP_PROOT="${dir}/bin/proot"
+debug "proot executable: ${NP_PROOT}"
+
+debug "testing all available runtimes..."
+if [[ -z "${NP_RUNTIME:-}" ]]; then
+  if [[ "${new_np_version}" = true ]]; then
+    debug "removing cached auto selected runtime"
+    rm -f "${dir}/conf/last_auto_runtime"
+  fi
+
+  if [[ -f "${dir}/conf/last_auto_runtime" ]]; then
+    last_auto_runtime=$(cat "${dir}/conf/last_auto_runtime")
+  else
+    last_auto_runtime=
+  fi
+
+  debug "last auto selected runtime: ${last_auto_runtime}"
+  if [[ -n "${last_auto_runtime}" ]]; then
+    NP_RUNTIME=${last_auto_runtime}
+  else
+    debug "testing nix --store"
+    if mkdir -p "${dir}/tmp" \
+    && touch "${dir}/tmp/testfile" \
+    && "${NP_NIX}" --store "${dir}/tmp/__store" shell -f "${dir}/mini-drv.nix" -c "${dir}/bin/nix" store add-file --store "${dir}/tmp/__store" "${dir}/tmp/testfile" >/dev/null 2>&3; then
+      chmod -R +w "${dir}/tmp/__store"
+      rm -r "${dir}/tmp/__store"
+      debug "nix --store works on this system -> will use nix as runtime"
+      NP_RUNTIME=nix
+    else
+      debug "nix --store failed -> testing bwrap"
+      if "${NP_BWRAP}" --bind "${dir}/emptyroot" / --bind "${dir}/" /nix --bind "${dir}/busybox/bin/busybox" "${dir}/true" "${dir}/true" 2>&3; then
+        debug "bwrap seems to work on this system -> will use bwrap"
+        NP_RUNTIME=bwrap
+      else
+        debug "bwrap doesn't work on this system -> will use proot"
+        NP_RUNTIME=proot
+      fi
+    fi
+  fi
+  printf '%s' "${NP_RUNTIME}" > "${dir}/conf/last_auto_runtime"
+else
+  debug "runtime selected via NP_RUNTIME: ${NP_RUNTIME}"
+fi
+
+debug "NP_RUNTIME: ${NP_RUNTIME}"
+run_cmd=()
+
+if [[ "${NP_RUNTIME}" = nix ]]; then
+  run_cmd=( "${NP_NIX}" shell -f "${dir}/mini-drv.nix" -c )
+  export PATH="${PATH}:${store}@nixStoreSubpath@/bin"
+  NP_CONF_STORE="${dir}"
+  recreate_nix_conf
+elif [[ "${NP_RUNTIME}" = bwrap ]]; then
+  collect_binds
+  bind_pairs+=( "${ssl_bind[@]}" )
+  make_bind_args --bind separate
+  bwrap_args=()
+  split_args bwrap_args "${BWRAP_ARGS:-}"
+  run_cmd=(
+    "${NP_BWRAP}"
+    "${bwrap_args[@]}"
+    --bind "${dir}/emptyroot" /
+    --dev-bind /dev /dev
+    --bind "${dir}/nix" /nix
+    "${bind_args[@]}"
+  )
+else
+  collect_binds
+  bind_pairs+=( "${ssl_bind[@]}" )
+  make_bind_args -b :
+  proot_args=()
+  split_args proot_args "${PROOT_ARGS:-}"
+  run_cmd=(
+    "${NP_PROOT}"
+    "${proot_args[@]}"
+    -r "${dir}/emptyroot"
+    -b /dev:/dev
+    -b "${dir}/nix:/nix"
+    "${bind_args[@]}"
+  )
+fi
+
+debug "base command will be: ${run_cmd[*]}"
+
+export NIX_PATH="${dir}/channels:nixpkgs=${dir}/channels/nixpkgs"
+mkdir -p "${dir}/channels"
+[[ -h "${dir}/channels/nixpkgs" ]] || ln -s @nixpkgsSrc@ "${dir}/channels/nixpkgs"
+
+missing=()
+if ! store_index=$(unzip -qqp "${self}" "@storeIndexZipPath@"); then
+  printf 'Fatal error: unable to read bundled store index\n'
+  exit 1
+fi
+while IFS= read -r path; do
+  basepath=$(basename "${path}")
+  if [[ ! -e "${store}/${basepath}" ]]; then
+    missing+=( "nix/store/${basepath}" )
+  fi
+done <<< "${store_index}"
+
+if ((${#missing[@]} > 0)); then
+  debug "extracting missing store paths"
+  mkdir -p "${dir}/tmp" "${store}"
+  rm -rf "${dir}/tmp"/*
+  (
+    cd "${dir}/tmp"
+    unzip -qqp "${self}" "@storeTarZipPath@" \
+      | "${dir}/bin/zstd" -d \
+      | tar -x "${missing[@]}" --strip-components 2
+  )
+  for extracted in "${dir}/tmp"/*; do
+    [[ -e "${extracted}" ]] || continue
+    mv "${extracted}" "${store}/"
+  done
+  rm -rf "${dir}/tmp"
+
+  debug "registering new store paths to DB"
+  unzip -qqp "${self}" "@storeRegistrationZipPath@" \
+    | "${run_cmd[@]}" "${store}@nixStoreSubpath@/bin/nix-store" --load-db
+fi
+
+executable="@bundledExe@"
+if [[ -n "${executable}" ]]; then
+  bin=${executable}
+  debug "executable is hardcoded to: ${bin}"
+elif [[ $(basename "$0") == nix-portable* ]]; then
+  if [[ $# -eq 0 ]]; then
+    printf 'Error: please specify the nix binary to execute\n'
+    printf 'Alternatively symlink against %s\n' "$0"
+    exit 1
+  elif [[ "$1" = debug ]]; then
+    bin=$(command -v "$2")
+    shift 2
+  else
+    bin="${store}@nixStoreSubpath@/bin/$1"
+    shift
+  fi
+else
+  bin="${store}@nixStoreSubpath@/bin/$(basename "$0")"
+fi
+
+if [[ -f "${dir}/conf/last_runtime" ]]; then
+  last_runtime=$(cat "${dir}/conf/last_runtime")
+else
+  last_runtime=
+fi
+
+if [[ "${new_np_version}" = true ]] || [[ "${last_runtime}" != "${NP_RUNTIME}" ]]; then
+  nix_bin=$(dirname "${bin}")/nix
+  debug "Testing if nix can build stuff without sandbox"
+  if ! "${run_cmd[@]}" "${nix_bin}" build --no-link -f "${dir}/mini-drv.nix" --option sandbox false >&3 2>&3; then
+    printf 'Fatal error: nix is unable to build packages\n'
+    exit 1
+  fi
+
+  debug "Testing if nix sandbox is functional"
+  if ! "${run_cmd[@]}" "${nix_bin}" build --no-link -f "${dir}/mini-drv.nix" --option sandbox true >&3 2>&3; then
+    debug "Sandbox doesn't work -> disabling sandbox"
+    NP_CONF_SANDBOX=false
+    recreate_nix_conf
+  else
+    debug "Sandboxed builds work -> enabling sandbox"
+    NP_CONF_SANDBOX=true
+    recreate_nix_conf
+  fi
+fi
+
+if [[ "${new_np_version}" = true ]]; then
+  printf '%s' "${fingerprint}" > "${dir}/conf/fingerprint"
+fi
+
+if [[ "${last_runtime}" != "${NP_RUNTIME}" ]]; then
+  printf '%s' "${NP_RUNTIME}" > "${dir}/conf/last_runtime"
+fi
+
+export PATH="${PATH_OLD}:${dir}/busybox/bin"
+export PATH="${dir}/tmpbin:${PATH}"
+
+if [[ "${do_install_git}" = true ]] && [[ ! -e "${store}@gitStoreSubpath@" ]]; then
+  printf 'Installing git. Disable this by specifying the git executable path with NP_GIT\n'
+  "${run_cmd[@]}" "${store}@nixStoreSubpath@/bin/nix" build --impure --no-link --expr "
+    (import @nixpkgsSrc@ {}).@gitAttribute@.out
+  "
+else
+  debug "git already installed or manually specified"
+fi
+
+if [[ "${do_install_git}" = true ]]; then
+  export PATH="@gitOut@/bin:${PATH}"
+fi
+
+end=$(date +%s%N)
+elapsed_ms=$(((end - start) / 1000000))
+debug "Time to initialize nix-portable: ${elapsed_ms} ms"
+
+if [[ -n "${NP_RUN:-}" ]]; then
+  split_args run_cmd "${NP_RUN}"
+fi
+
+debug "running command: ${run_cmd[*]} ${bin} $*"
+exec "${run_cmd[@]}" "${bin}" "$@"
+exit 0

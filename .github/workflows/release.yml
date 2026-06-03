@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: build release artifacts
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build release binaries
+        run: nix build .#release
+
+      - name: Build npm distribution
+        run: nix build .#npm-dist -o npm-dist
+
+      - name: Pack npm packages
+        run: |
+          set -euo pipefail
+          mkdir -p npm-packed
+          for pkg in npm-dist/packages/nix-linux-x64 npm-dist/packages/nix-linux-arm64 npm-dist/packages/nix; do
+            npm pack "$pkg" --pack-destination npm-packed
+          done
+
+      - name: Upload GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            result/nix-portable-x86_64
+            result/nix-portable-aarch64
+            npm-packed/*.tgz
+
+      - name: Publish npm packages
+        if: startsWith(github.ref, 'refs/tags/') && env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm publish npm-dist/packages/nix-linux-x64 --access public --provenance
+          npm publish npm-dist/packages/nix-linux-arm64 --access public --provenance
+          npm publish npm-dist/packages/nix --access public --provenance

@@ -23,6 +23,8 @@
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
+      npmVersion = "2.20.6-portable.0";
+
       forAllSystems = f: genAttrs supportedSystems
         (system: f system (import inp.nixpkgs { inherit system; }));
 
@@ -137,14 +139,20 @@
           release = pkgs.runCommand "all-nix-portable-release-files" {} ''
             mkdir $out
             cp ${self.packages.x86_64-linux.nix-portable}/bin/nix-portable $out/nix-portable-x86_64
-            cp ${self.packages.aarch64-linux.nix-portable}/bin/nix-portable $out/nix-portable-aarch64
+            cp ${self.packages.x86_64-linux.nix-portable-aarch64-linux}/bin/nix-portable $out/nix-portable-aarch64
           '';
+        } // lib.optionalAttrs (system == "x86_64-linux") {
+          npm-dist = pkgs.callPackage ./nix/npm-dist.nix {
+            version = npmVersion;
+            nixPortableX64 = self.packages.x86_64-linux.nix-portable-dev;
+            nixPortableArm64 = self.packages.x86_64-linux.nix-portable-aarch64-linux;
+          };
         });
       })
       { packages = (genAttrs [ "x86_64-linux" ] (system:
-          (listToAttrs (map (crossSystem:
+          listToAttrs (map (crossSystem:
             nameValuePair "nix-portable-${crossSystem}" (nixPortableForSystem { inherit crossSystem system; } )
-          ) [ "aarch64-linux" ]))
+          ) [ "aarch64-linux" ])
         ));
 
         githubActions = nix-github-actions.lib.mkGithubMatrix {
